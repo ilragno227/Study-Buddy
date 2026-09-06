@@ -31,7 +31,7 @@ from sentence_transformers import SentenceTransformer
 # aliases are convenient but have been less reliable in practice. Update
 # this manually if Google deprecates the version (check
 # https://ai.google.dev/gemini-api/docs/models for current options).
-GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_MODEL = "gemini-3.6-flash"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Replace these with direct .gif/.png links (right click the Tenor GIF ->
