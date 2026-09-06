@@ -12,11 +12,13 @@ Run locally:
 import json
 import os
 import re
+import time
 
 import faiss
 import numpy as np
 import streamlit as st
 from google import genai
+from google.genai import errors as genai_errors
 from google.genai import types as genai_types
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
@@ -25,11 +27,11 @@ from sentence_transformers import SentenceTransformer
 # Config & constants
 # ──────────────────────────────────────────────────────────────────────────
 
-# "gemini-flash-latest" always points at Google's current stable Flash
-# model, so this doesn't need updating every time a model version is
-# deprecated. Pin to a specific version (e.g. "gemini-2.5-flash") instead
-# if you want reproducible behavior across Gemini upgrades.
-GEMINI_MODEL = "gemini-flash-latest"
+# Pinned to a specific stable version rather than the "-latest" alias —
+# aliases are convenient but have been less reliable in practice. Update
+# this manually if Google deprecates the version (check
+# https://ai.google.dev/gemini-api/docs/models for current options).
+GEMINI_MODEL = "gemini-2.5-flash"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Replace these with direct .gif/.png links (right click the Tenor GIF ->
@@ -280,18 +282,41 @@ def load_gemini_client():
     return genai.Client(api_key=api_key)
 
 
-def generate_with_llm(prompt, max_new_tokens=1024, temperature=0.7):
+def generate_with_llm(prompt, max_new_tokens=1024, temperature=0.7, retries=2):
     client = load_gemini_client()
 
-    response = client.models.generate_content(
-        model=GEMINI_MODEL,
-        contents=prompt,
-        config=genai_types.GenerateContentConfig(
-            temperature=temperature,
-            max_output_tokens=max_new_tokens,
-        ),
+    last_error = None
+    for attempt in range(retries + 1):
+        try:
+            response = client.models.generate_content(
+                model=GEMINI_MODEL,
+                contents=prompt,
+                config=genai_types.GenerateContentConfig(
+                    temperature=temperature,
+                    max_output_tokens=max_new_tokens,
+                ),
+            )
+            return (response.text or "").strip()
+
+        except genai_errors.ServerError as e:
+            # Gemini's own servers returned a 5xx — usually transient.
+            # Back off briefly and retry before giving up.
+            last_error = e
+            if attempt < retries:
+                time.sleep(2 * (attempt + 1))
+                continue
+
+        except genai_errors.ClientError as e:
+            # 4xx — retrying won't help (bad key, bad request, quota, etc).
+            st.error(f"Gemini rejected the request: {e}")
+            st.stop()
+
+    st.error(
+        f"Gemini's servers returned an error after {retries + 1} attempts: "
+        f"{last_error}\n\nThis is usually transient — try again in a moment. "
+        "If it persists, check https://status.cloud.google.com for outages."
     )
-    return (response.text or "").strip()
+    st.stop()
 
 
 # ──────────────────────────────────────────────────────────────────────────
