@@ -1,8 +1,5 @@
 streamlit>=1.32
-torch
-transformers>=4.44
-accelerate
-bitsandbytes
+google-genai
 sentence-transformers
 pypdf
 faiss-cpu

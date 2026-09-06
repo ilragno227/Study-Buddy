@@ -10,21 +10,26 @@ Run locally:
 """
 
 import json
+import os
 import re
 
 import faiss
 import numpy as np
 import streamlit as st
-import torch
+from google import genai
+from google.genai import types as genai_types
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 
 # ──────────────────────────────────────────────────────────────────────────
 # Config & constants
 # ──────────────────────────────────────────────────────────────────────────
 
-GENERATION_MODEL = "Qwen/Qwen2.5-7B-Instruct"
+# "gemini-flash-latest" always points at Google's current stable Flash
+# model, so this doesn't need updating every time a model version is
+# deprecated. Pin to a specific version (e.g. "gemini-2.5-flash") instead
+# if you want reproducible behavior across Gemini upgrades.
+GEMINI_MODEL = "gemini-flash-latest"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Replace these with direct .gif/.png links (right click the Tenor GIF ->
@@ -261,48 +266,32 @@ def load_embedding_model():
     return SentenceTransformer(EMBEDDING_MODEL, device="cpu")
 
 
-@st.cache_resource(show_spinner="Loading Qwen LLM (this can take a while)...")
-def load_llm():
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
-        bnb_4bit_use_double_quant=True,
-    )
-
-    tokenizer = AutoTokenizer.from_pretrained(GENERATION_MODEL)
-    model = AutoModelForCausalLM.from_pretrained(
-        GENERATION_MODEL,
-        quantization_config=bnb_config if device == "cuda" else None,
-        device_map="auto" if device == "cuda" else None,
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    )
-
-    return tokenizer, model, device
+@st.cache_resource(show_spinner="Connecting to Gemini...")
+def load_gemini_client():
+    # Reads the key from Streamlit secrets first, then falls back to an
+    # environment variable — set one of these before running the app.
+    api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
+    if not api_key:
+        st.error(
+            "No Gemini API key found. Add GEMINI_API_KEY to your Streamlit "
+            "secrets (Settings → Secrets) or as an environment variable."
+        )
+        st.stop()
+    return genai.Client(api_key=api_key)
 
 
 def generate_with_llm(prompt, max_new_tokens=1024, temperature=0.7):
-    tokenizer, model, device = load_llm()
+    client = load_gemini_client()
 
-    messages = [{"role": "user", "content": prompt}]
-    text = tokenizer.apply_chat_template(
-        messages, tokenize=False, add_generation_prompt=True
+    response = client.models.generate_content(
+        model=GEMINI_MODEL,
+        contents=prompt,
+        config=genai_types.GenerateContentConfig(
+            temperature=temperature,
+            max_output_tokens=max_new_tokens,
+        ),
     )
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
-
-    output_ids = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        top_p=0.9,
-        do_sample=True,
-        pad_token_id=tokenizer.eos_token_id,
-    )
-
-    response_ids = output_ids[0][inputs["input_ids"].shape[1]:]
-    return tokenizer.decode(response_ids, skip_special_tokens=True).strip()
+    return (response.text or "").strip()
 
 
 # ──────────────────────────────────────────────────────────────────────────
