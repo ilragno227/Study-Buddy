@@ -144,48 +144,6 @@ HOW YOU TEACH
 
 st.set_page_config(page_title="Study Buddy", page_icon="🧠", layout="wide")
 
-CUSTOM_CSS = """
-<style>
-:root {
-    --sb-olive: #7c8a3e;
-    --sb-olive-dark: #5a6530;
-    --sb-olive-darker: #454e24;
-    --sb-black: #232318;
-    --sb-cream: #f5f5ee;
-}
-.stApp { background-color: #eeeeea; }
-h1, h2, h3 { color: var(--sb-olive-darker) !important; font-weight: 800 !important; }
-.stButton>button, .stFormSubmitButton>button {
-    background-color: var(--sb-olive); color: white; border: 2px solid var(--sb-olive-darker);
-    border-radius: 10px; font-weight: 700;
-}
-.stButton>button:hover, .stFormSubmitButton>button:hover {
-    background-color: var(--sb-olive-dark); border-color: var(--sb-black);
-}
-.stTabs [data-baseweb="tab-list"] { gap: 8px; }
-.stTabs [data-baseweb="tab"] {
-    background-color: var(--sb-cream); border-radius: 10px 10px 0 0; border: 2px solid var(--sb-olive);
-    border-bottom: none; padding: 8px 18px; font-weight: 700; color: var(--sb-olive-darker);
-}
-.stTabs [aria-selected="true"] { background-color: var(--sb-olive) !important; color: white !important; }
-section[data-testid="stSidebar"] { background-color: var(--sb-cream); border-right: 3px solid var(--sb-olive); }
-.sb-card {
-    background-color: var(--sb-cream); border: 2px solid var(--sb-olive); border-radius: 14px;
-    padding: 1.1rem 1.3rem; margin-bottom: 0.9rem;
-}
-.sb-card .sb-q { font-weight: 700; color: var(--sb-olive-darker); margin-bottom: 0.4rem; }
-.sb-result-win {
-    background-color: var(--sb-olive); color: white; text-align: center; padding: 1.5rem;
-    border-radius: 14px; font-size: 1.8rem; font-weight: 900; text-transform: uppercase;
-}
-.sb-result-lose {
-    background-color: var(--sb-black); color: var(--sb-cream); text-align: center; padding: 1.5rem;
-    border-radius: 14px; font-size: 1.8rem; font-weight: 900; text-transform: uppercase;
-}
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
-
 # ──────────────────────────────────────────────────────────────────────────
 # API key resolution
 # ──────────────────────────────────────────────────────────────────────────
@@ -515,6 +473,8 @@ for key, default in {
     "voice_enabled": True,
     "conversation_history": [],
     "flashcards": [],
+    "current_card": 0,
+    "show_answer": False,
     "quiz_questions": [],
     "quiz_submitted": False,
 }.items():
@@ -563,6 +523,8 @@ with st.sidebar:
         st.session_state.index = index
         st.session_state.conversation_history = []
         st.session_state.flashcards = []
+        st.session_state.current_card = 0
+        st.session_state.show_answer = False
         st.session_state.quiz_questions = []
         st.session_state.quiz_submitted = False
 
@@ -578,13 +540,8 @@ with st.sidebar:
 # Header
 # ──────────────────────────────────────────────────────────────────────────
 
-st.markdown(
-    """
-    <div class="sb-title"><h1>🧠 Study Buddy</h1></div>
-    <p>Chat with your notes, build flashcards, and quiz yourself — all grounded in your own PDFs.</p>
-    """,
-    unsafe_allow_html=True,
-)
+st.title("🧠 Study Buddy")
+st.write("Chat with your notes, build flashcards, and quiz yourself — all grounded in your own PDFs.")
 
 ready = st.session_state.chunks is not None and st.session_state.index is not None
 
@@ -651,20 +608,43 @@ with tab_flashcards:
                 st.session_state.flashcards = generate_flashcards(
                     st.session_state.chunks, num_cards=num_cards
                 )
+            st.session_state.current_card = 0
+            st.session_state.show_answer = False
             if not st.session_state.flashcards:
                 st.error("Couldn't parse flashcards from the model's response. Try again.")
 
-        if st.session_state.flashcards:
-            for i, card in enumerate(st.session_state.flashcards, start=1):
-                st.markdown(
-                    f"""
-                    <div class="sb-card">
-                        <div class="sb-q">Card {i}: {card['question']}</div>
-                        <div>{card['answer']}</div>
-                    </div>
-                    """,
-                    unsafe_allow_html=True,
-                )
+        cards = st.session_state.flashcards
+        if not cards:
+            st.caption("No flashcards yet — click **Generate Flashcards** above.")
+        else:
+            idx = st.session_state.current_card
+            card = cards[idx]
+
+            st.subheader(f"Card {idx + 1} / {len(cards)}")
+            if st.session_state.show_answer:
+                st.write(card["answer"])
+            else:
+                st.write(card["question"])
+
+            nav_prev, nav_flip, nav_next = st.columns([1, 2, 1])
+
+            with nav_prev:
+                if st.button("⬅️ Previous", use_container_width=True, disabled=idx == 0):
+                    st.session_state.current_card -= 1
+                    st.session_state.show_answer = False
+                    st.rerun()
+
+            with nav_flip:
+                flip_label = "🙈 Hide Answer" if st.session_state.show_answer else "🔍 Show Answer"
+                if st.button(flip_label, use_container_width=True):
+                    st.session_state.show_answer = not st.session_state.show_answer
+                    st.rerun()
+
+            with nav_next:
+                if st.button("Next ➡️", use_container_width=True, disabled=idx == len(cards) - 1):
+                    st.session_state.current_card += 1
+                    st.session_state.show_answer = False
+                    st.rerun()
 
 # ──────────────────────────────────────────────────────────────────────────
 # Quiz tab
@@ -732,10 +712,10 @@ with tab_quiz:
             won = answered > 0 and (score / answered) >= 0.5
 
             if won:
-                st.markdown(f'<div class="sb-result-win">{WIN_MESSAGE}</div>', unsafe_allow_html=True)
+                st.success(WIN_MESSAGE)
                 show_result_image(WIN_IMAGE_URL, "+100000 social credit")
             else:
-                st.markdown(f'<div class="sb-result-lose">{LOSE_MESSAGE}</div>', unsafe_allow_html=True)
+                st.error(LOSE_MESSAGE)
                 show_result_image(LOSE_IMAGE_URL, "-10000 social credit")
 
             with st.expander("Review answers"):
