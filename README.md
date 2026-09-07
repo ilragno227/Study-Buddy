@@ -35,4 +35,4 @@ A RAG-powered study assistant built with Streamlit. Made to make studying more f
 - Mohamed Mahmoud
 - Merna Mohamed
 - Ranya Farrag
-- Youssef Abady
+- Youssef Abady . 
