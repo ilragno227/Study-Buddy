@@ -1,89 +1,53 @@
 """
 Study Buddy — Streamlit App
 ============================
-A RAG-powered study assistant with three tabs: Chat, Flashcards, and Quiz.
-Upload one or more study PDFs, build the vector index, then chat with the
-material, generate flashcards, or take a generated multiple-choice quiz.
-Chat answers can optionally be read aloud with a local Kokoro TTS voice.
+Chat, Flashcards, and Quiz tabs, backed by Groq for generation (no local
+model, no GPU needed — works fine on Streamlit Cloud's free tier) and
+Kokoro for spoken answers in the Chat tab.
 
-Run locally:
-    streamlit run app.py
+Needs two things set up before it'll run:
+  1. A Groq API key: GROQ_API_KEY in Streamlit secrets or as an env var.
+     Get one free at https://console.groq.com/keys
+  2. A packages.txt file (repo root) containing the line "espeak-ng" —
+     Kokoro TTS needs it as a system dependency, not just a pip package.
 """
 
-import io
 import json
 import os
 import re
-import time
+import tempfile
 
 import faiss
 import numpy as np
 import streamlit as st
-from google import genai
-from google.genai import errors as genai_errors
-from google.genai import types as genai_types
+from groq import Groq
 from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
-
-# Kokoro TTS is optional: if it (or one of its own dependencies, e.g. the
-# espeak-ng system package) isn't available, the rest of the app must keep
-# working — voice just quietly disables itself.
-try:
-    from kokoro import KPipeline
-    import soundfile as sf
-
-    TTS_IMPORT_ERROR = None
-except Exception as e:  # pragma: no cover - depends on deployment environment
-    KPipeline = None
-    sf = None
-    TTS_IMPORT_ERROR = str(e)
-
-TTS_AVAILABLE = TTS_IMPORT_ERROR is None
 
 # ──────────────────────────────────────────────────────────────────────────
 # Config & constants
 # ──────────────────────────────────────────────────────────────────────────
 
-# Pinned to a specific stable version rather than the "-latest" alias —
-# aliases are convenient but have been less reliable in practice. Update
-# this manually if Google deprecates the version (check
-# https://ai.google.dev/gemini-api/docs/models for current options).
-GEMINI_MODEL = "gemini-3.6-flash"
+# gpt-oss-120b is a good default: strong quality, generous context, fast on
+# Groq's hardware. Swap to "openai/gpt-oss-20b" for lower latency or
+# "qwen/qwen3.6-27b" as another option — check console.groq.com/docs/models
+# for what's currently available.
+GENERATION_MODEL = "openai/gpt-oss-120b"
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 
-# Gemini 3.x models "think" before answering by default, and — this is the
-# part that isn't obvious from the docs — those hidden thinking tokens are
-# deducted from the SAME max_output_tokens budget as the visible answer.
-# With a low max_output_tokens (the previous version used 1024-2000) the
-# model can spend the entire budget thinking and leave nothing for the
-# actual reply, which is exactly what caused answers/flashcards/quizzes to
-# come back empty or cut off mid-sentence. The fix is two-part: keep
-# thinking effort low (we don't need deep reasoning for grounded Q&A over a
-# student's own notes) AND give each task a generous token ceiling.
-THINKING_LEVEL = genai_types.ThinkingLevel.LOW
+TTS_VOICE = "af_heart"
+TTS_SPEED = 1.05
+TTS_SAMPLE_RATE = 24000
 
-MAX_TOKENS_CHAT = 4096
-MAX_TOKENS_FLASHCARDS = 4096
-MAX_TOKENS_QUIZ = 6144
+MAX_QUIZ_QUESTIONS = 20
 
-# Optional local images shown on the quiz results screen. The previous
-# version hot-linked tenor.com "view" page URLs, which are HTML pages, not
-# image files — st.image can't render those, which is why the images never
-# loaded. Direct-linking third-party meme CDNs is also fragile long-term
-# (links rot). If you want a custom image, drop a file at one of these
-# paths in your repo; otherwise the app falls back to a built-in Streamlit
-# celebration effect, which always works with zero setup.
-WIN_IMAGE_PATH = "assets/win.gif"
-LOSE_IMAGE_PATH = "assets/lose.gif"
+# Replace with direct .gif/.png links (right click the Tenor GIF ->
+# "Copy image address"). tenor.com/view/... page links won't render inline.
+WIN_IMAGE_URL = "https://tenor.com/view/social-credit-credit-social-уважение-плюс-уважение-gif-1626328442317885176"
+LOSE_IMAGE_URL = "https://tenor.com/view/nalog-gif-25906765"
 
 WIN_MESSAGE = "You Win, gg wp"
 LOSE_MESSAGE = "You Lose, train harder twin!"
-
-# Kokoro voice settings (matches the original notebook prototype).
-TTS_VOICE = "af_heart"
-TTS_SPEED = 1.05
-TTS_LANG_CODE = "a"  # American English
-TTS_SAMPLE_RATE = 24000
 
 QUIZ_MODES = {
     "EZ": """
@@ -139,20 +103,28 @@ Format:
 ]
 """
 
+# Chat answers may be spoken aloud by Kokoro, so the system prompt bans
+# markdown and emoji outright — both read terribly through TTS and there's
+# no clean way to strip only "the bad parts" after the fact.
 SYSTEM_PROMPT = """
 IDENTITY
 
 You are StudyBuddy, a sharp and encouraging AI study coach. A student
-has handed you a PDF they're trying to learn, and your job is to make
+has handed you material they're trying to learn, and your job is to make
 it click for them - not recite it back.
+
+Every answer you give may be read out loud by a text-to-speech voice, in
+addition to being shown as text. Because of that:
+- Never use markdown symbols - no **, ##, -, *, `, > or bullet dashes.
+- Never use emoji.
+Write the way a real tutor talks out loud: plain sentences, natural
+spoken structure, nothing that only makes sense on a screen.
 
 GROUNDING RULES
 
-1. Answer using only the retrieved PDF context you're given. Do not add
+1. Answer using only the retrieved context you're given. Do not add
    outside facts, even ones you're confident are true.
-2. If the context doesn't contain the answer, say so plainly - for
-   example: "I don't see that covered in this material." Never imply the
-   material said something it didn't.
+2. If the context doesn't contain the answer, say so plainly.
 3. You may reference earlier turns in the conversation for continuity,
    but the retrieved context is always the source of truth for facts.
 
@@ -160,27 +132,74 @@ HOW YOU TEACH
 
 - Lead with plain language, then introduce the technical term once the
   idea already makes sense.
-- Use a short real-world analogy only when it genuinely clarifies
-  something.
-- Keep answers tight: a few short paragraphs by default. Only go longer
-  if the student explicitly asks for more depth.
+- Walk through processes as a spoken sequence - first this, then that -
+  never as a numbered or bulleted list.
+- Keep answers tight: a few short spoken paragraphs by default.
 - Never say "as an AI" or reference being a language model.
 """
 
 # ──────────────────────────────────────────────────────────────────────────
-# Page config
+# Page config & styling (matches the Study Buddy logo: olive green + cream)
 # ──────────────────────────────────────────────────────────────────────────
-# No custom CSS / color overrides — using Streamlit's default theme as
-# requested. Native components (st.container(border=True), st.success,
-# st.error, etc.) already look consistent and adapt to light/dark mode for
-# free, which the old hand-rolled HTML+CSS cards didn't.
 
-st.set_page_config(
-    page_title="Study Buddy",
-    page_icon="🧠",
-    layout="wide",
-    initial_sidebar_state="expanded",
-)
+st.set_page_config(page_title="Study Buddy", page_icon="🧠", layout="wide")
+
+CUSTOM_CSS = """
+<style>
+:root {
+    --sb-olive: #7c8a3e;
+    --sb-olive-dark: #5a6530;
+    --sb-olive-darker: #454e24;
+    --sb-black: #232318;
+    --sb-cream: #f5f5ee;
+}
+.stApp { background-color: #eeeeea; }
+h1, h2, h3 { color: var(--sb-olive-darker) !important; font-weight: 800 !important; }
+.stButton>button, .stFormSubmitButton>button {
+    background-color: var(--sb-olive); color: white; border: 2px solid var(--sb-olive-darker);
+    border-radius: 10px; font-weight: 700;
+}
+.stButton>button:hover, .stFormSubmitButton>button:hover {
+    background-color: var(--sb-olive-dark); border-color: var(--sb-black);
+}
+.stTabs [data-baseweb="tab-list"] { gap: 8px; }
+.stTabs [data-baseweb="tab"] {
+    background-color: var(--sb-cream); border-radius: 10px 10px 0 0; border: 2px solid var(--sb-olive);
+    border-bottom: none; padding: 8px 18px; font-weight: 700; color: var(--sb-olive-darker);
+}
+.stTabs [aria-selected="true"] { background-color: var(--sb-olive) !important; color: white !important; }
+section[data-testid="stSidebar"] { background-color: var(--sb-cream); border-right: 3px solid var(--sb-olive); }
+.sb-card {
+    background-color: var(--sb-cream); border: 2px solid var(--sb-olive); border-radius: 14px;
+    padding: 1.1rem 1.3rem; margin-bottom: 0.9rem;
+}
+.sb-card .sb-q { font-weight: 700; color: var(--sb-olive-darker); margin-bottom: 0.4rem; }
+.sb-result-win {
+    background-color: var(--sb-olive); color: white; text-align: center; padding: 1.5rem;
+    border-radius: 14px; font-size: 1.8rem; font-weight: 900; text-transform: uppercase;
+}
+.sb-result-lose {
+    background-color: var(--sb-black); color: var(--sb-cream); text-align: center; padding: 1.5rem;
+    border-radius: 14px; font-size: 1.8rem; font-weight: 900; text-transform: uppercase;
+}
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+
+# ──────────────────────────────────────────────────────────────────────────
+# API key resolution
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def resolve_api_key():
+    try:
+        secret_key = st.secrets.get("GROQ_API_KEY")
+        if secret_key:
+            return secret_key
+    except Exception:
+        pass
+    return os.environ.get("GROQ_API_KEY", "")
+
 
 # ──────────────────────────────────────────────────────────────────────────
 # Cached model loaders
@@ -192,137 +211,67 @@ def load_embedding_model():
     return SentenceTransformer(EMBEDDING_MODEL, device="cpu")
 
 
-@st.cache_resource(show_spinner="Connecting to Gemini...")
-def load_gemini_client():
-    # Reads the key from Streamlit secrets first, then falls back to an
-    # environment variable — set one of these before running the app.
-    api_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY"))
-    if not api_key:
-        st.error(
-            "No Gemini API key found. Add GEMINI_API_KEY to your Streamlit "
-            "secrets (Settings → Secrets) or as an environment variable."
-        )
+@st.cache_resource(show_spinner="Connecting to Groq...")
+def load_llm(api_key):
+    return Groq(api_key=api_key)
+
+
+@st.cache_resource(show_spinner="Loading Kokoro TTS...")
+def load_tts():
+    from kokoro import KPipeline
+    return KPipeline(lang_code="a")
+
+
+def generate_with_llm(prompt, max_new_tokens=1024, temperature=0.7, reasoning_effort="low"):
+    client = st.session_state.get("llm")
+    if client is None:
+        st.error("Groq isn't connected yet — enter an API key and click Build Study Buddy.")
         st.stop()
-    return genai.Client(api_key=api_key)
 
-
-@st.cache_resource(show_spinner="Loading Kokoro voice model (first run only)...")
-def load_tts_pipeline():
-    # Raises on failure; callers catch this rather than us swallowing it
-    # here, so a transient failure (e.g. HF Hub hiccup on first download)
-    # can be retried instead of being cached as a permanent None.
-    return KPipeline(lang_code=TTS_LANG_CODE, device="cpu")
-
-
-def get_tts_pipeline_safe():
-    """Returns (pipeline, error_message). Never raises."""
-    if not TTS_AVAILABLE:
-        return None, (
-            "Kokoro isn't installed in this environment "
-            f"({TTS_IMPORT_ERROR}). Check requirements.txt and packages.txt."
-        )
-    try:
-        return load_tts_pipeline(), None
-    except Exception as e:
-        return None, str(e)
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Gemini calls
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def _build_config(max_output_tokens, temperature):
-    return genai_types.GenerateContentConfig(
+    response = client.chat.completions.create(
+        model=GENERATION_MODEL,
+        messages=[{"role": "user", "content": prompt}],
+        max_tokens=max_new_tokens,
         temperature=temperature,
-        max_output_tokens=max_output_tokens,
-        thinking_config=genai_types.ThinkingConfig(thinking_level=THINKING_LEVEL),
+        top_p=0.9,
+        reasoning_effort=reasoning_effort,
     )
+    return response.choices[0].message.content.strip()
 
 
-def _finish_reason_name(response):
-    if response.candidates:
-        reason = response.candidates[0].finish_reason
-        return reason.name if reason is not None else None
-    return None
+def clean_for_speech(text):
+    text = re.sub(r"[*_#>`]", "", text)
+    text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def call_gemini(prompt, max_output_tokens=2048, temperature=0.7, retries=2):
-    """Non-streaming call. Returns (text, truncated) where truncated is True
-    if the model hit MAX_TOKENS (thinking + answer together ran out of
-    room) — callers use this to retry with a bigger budget instead of
-    silently returning an empty string."""
-    client = load_gemini_client()
-    config = _build_config(max_output_tokens, temperature)
+def generate_speech(text, filename):
+    import soundfile as sf
 
-    last_error = None
-    for attempt in range(retries + 1):
-        try:
-            response = client.models.generate_content(
-                model=GEMINI_MODEL,
-                contents=prompt,
-                config=config,
-            )
-            text = (response.text or "").strip()
-            truncated = _finish_reason_name(response) == "MAX_TOKENS"
-            return text, truncated
+    tts = st.session_state.get("tts")
+    if tts is None:
+        return None
 
-        except genai_errors.ServerError as e:
-            # Gemini's own servers returned a 5xx — usually transient.
-            # Back off briefly and retry before giving up.
-            last_error = e
-            if attempt < retries:
-                time.sleep(2 * (attempt + 1))
-                continue
+    text = clean_for_speech(text)
+    if not text:
+        return None
 
-        except genai_errors.ClientError as e:
-            # 4xx — retrying won't help (bad key, bad request, quota, etc).
-            st.error(f"Gemini rejected the request: {e}")
-            st.stop()
+    audio_parts = []
+    for _, _, audio in tts(
+        text,
+        voice=TTS_VOICE,
+        speed=TTS_SPEED,
+        split_pattern=r"(?<=[.!?])\s+",
+    ):
+        audio_parts.append(np.asarray(audio, dtype=np.float32))
 
-    st.error(
-        f"Gemini's servers returned an error after {retries + 1} attempts: "
-        f"{last_error}\n\nThis is usually transient — try again in a moment. "
-        "If it persists, check https://status.cloud.google.com for outages."
-    )
-    st.stop()
+    if not audio_parts:
+        return None
 
-
-def call_gemini_with_headroom(prompt, max_output_tokens, temperature=0.7):
-    """Calls Gemini and, if the response was cut off by MAX_TOKENS with
-    little or nothing to show for it, retries once with double the token
-    budget. This is the safety net for the thinking-tokens-eat-the-budget
-    problem described above."""
-    text, truncated = call_gemini(prompt, max_output_tokens, temperature)
-    if truncated and len(text) < 20:
-        text, truncated = call_gemini(
-            prompt, min(max_output_tokens * 2, 16000), temperature
-        )
-    return text, truncated
-
-
-def stream_chat_response(prompt, max_output_tokens, temperature, result_holder):
-    """Generator for st.write_stream. Yields visible text chunks as they
-    arrive; records the finish reason into result_holder once the stream
-    ends so the caller can warn on truncation."""
-    client = load_gemini_client()
-    config = _build_config(max_output_tokens, temperature)
-    try:
-        stream = client.models.generate_content_stream(
-            model=GEMINI_MODEL, contents=prompt, config=config
-        )
-        last_chunk = None
-        for chunk in stream:
-            last_chunk = chunk
-            piece = chunk.text
-            if piece:
-                yield piece
-        result_holder["truncated"] = (
-            last_chunk is not None and _finish_reason_name(last_chunk) == "MAX_TOKENS"
-        )
-    except genai_errors.APIError as e:
-        result_holder["error"] = str(e)
-        yield f"\n\n⚠️ Gemini error: {e}"
+    audio = np.concatenate(audio_parts)
+    sf.write(filename, audio, TTS_SAMPLE_RATE)
+    return filename
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -330,8 +279,8 @@ def stream_chat_response(prompt, max_output_tokens, temperature, result_holder):
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def extract_text_from_pdf(file_obj, source_name):
-    reader = PdfReader(file_obj)
+def extract_text_from_pdf(path, source_name):
+    reader = PdfReader(path)
     pages = []
     for page_number, page in enumerate(reader.pages):
         text = page.extract_text()
@@ -353,8 +302,7 @@ def create_chunks(pages, chunk_size=1000, overlap=200):
         start = 0
         while start < len(text):
             end = start + chunk_size
-            chunk_text = text[start:end]
-            chunks.append({"text": chunk_text, "page": page["page"], "source": page["source"]})
+            chunks.append({"text": text[start:end], "page": page["page"], "source": page["source"]})
             start += chunk_size - overlap
     return chunks
 
@@ -364,21 +312,21 @@ def build_index(uploaded_files):
 
     all_pages = []
     for f in uploaded_files:
-        pages = extract_text_from_pdf(f, f.name)
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+            tmp.write(f.read())
+            tmp_path = tmp.name
+        pages = extract_text_from_pdf(tmp_path, f.name)
+        os.remove(tmp_path)
         for p in pages:
             p["text"] = clean_text(p["text"])
         all_pages.extend(pages)
 
     chunks = create_chunks(all_pages)
-
     if not chunks:
-        st.error(
-            "Couldn't extract any text from the uploaded PDF(s). If these "
-            "are scanned/image-only pages, they'll need OCR before Study "
-            "Buddy can index them."
-        )
-        return None, None
+        return None, None, "Couldn't extract any text from the uploaded PDF(s)."
 
+    # Batch-encode all chunks in one call rather than one at a time —
+    # much faster than looping per-chunk for anything but tiny documents.
     embeddings = embedding_model.encode(
         [c["text"] for c in chunks], convert_to_numpy=True, show_progress_bar=False
     ).astype("float32")
@@ -387,7 +335,8 @@ def build_index(uploaded_files):
     index = faiss.IndexFlatIP(embeddings.shape[1])
     index.add(embeddings)
 
-    return chunks, index
+    status = f"Indexed {len(chunks)} chunks from {len(uploaded_files)} file(s). Ready!"
+    return chunks, index, status
 
 
 def embed_query(query):
@@ -403,6 +352,8 @@ def retrieve_relevant_chunks(query, chunks, index, top_k=5):
 
     results = []
     for score, idx in zip(scores[0], indices[0]):
+        if idx == -1:
+            continue
         results.append(
             {
                 "text": chunks[idx]["text"],
@@ -419,7 +370,7 @@ def build_context(results):
     return "\n\n".join(parts)
 
 
-def build_chat_prompt(question, conversation_history, chunks, index, top_k=5):
+def study_buddy_answer(question, conversation_history, chunks, index, top_k=5):
     results = retrieve_relevant_chunks(question, chunks, index, top_k=top_k)
     context = build_context(results)
 
@@ -427,7 +378,7 @@ def build_chat_prompt(question, conversation_history, chunks, index, top_k=5):
     for message in conversation_history:
         history += f"\nStudent: {message['question']}\nStudyBuddy: {message['answer']}\n"
 
-    return f"""
+    prompt = f"""
 {SYSTEM_PROMPT}
 
 PREVIOUS CONVERSATION:
@@ -441,67 +392,7 @@ CURRENT STUDENT QUESTION:
 
 Answer the student naturally while staying grounded in the retrieved context.
 """
-
-
-# ──────────────────────────────────────────────────────────────────────────
-# Robust JSON extraction (handles responses truncated mid-array/object)
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def _strip_fences(raw):
-    raw = raw.strip()
-    raw = re.sub(r"^```(json)?", "", raw, flags=re.IGNORECASE).strip()
-    raw = re.sub(r"```$", "", raw).strip()
-    return raw
-
-
-def _extract_json_array(raw):
-    """Parses a JSON array from raw text, repairing a truncated tail by
-    dropping back to the last complete element if needed."""
-    raw = _strip_fences(raw)
-    start = raw.find("[")
-    if start == -1:
-        return None
-    raw = raw[start:]
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    last_close = raw.rfind("}")
-    if last_close == -1:
-        return None
-    candidate = raw[: last_close + 1] + "]"
-    try:
-        return json.loads(candidate)
-    except json.JSONDecodeError:
-        return None
-
-
-def _extract_json_object_array(raw, array_key):
-    """Same idea as _extract_json_array but for a top-level object like
-    {"questions": [...]} that may have been cut off mid-array."""
-    raw = _strip_fences(raw)
-    start = raw.find("{")
-    if start == -1:
-        return None
-    raw = raw[start:]
-
-    try:
-        return json.loads(raw)
-    except json.JSONDecodeError:
-        pass
-
-    arr_start = raw.find("[")
-    last_close = raw.rfind("}")
-    if arr_start == -1 or last_close == -1 or last_close <= arr_start:
-        return None
-    candidate_array = raw[arr_start : last_close + 1] + "]"
-    try:
-        return {array_key: json.loads(candidate_array)}
-    except json.JSONDecodeError:
-        return None
+    return generate_with_llm(prompt)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -509,25 +400,27 @@ def _extract_json_object_array(raw, array_key):
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _sample_context(chunks, sample_chunks=12):
+def generate_flashcards(chunks, num_cards=8, sample_chunks=12):
     step = max(1, len(chunks) // sample_chunks)
     sample = chunks[::step][:sample_chunks]
-    return "\n\n".join(c["text"] for c in sample)
+    context = "\n\n".join(c["text"] for c in sample)
 
+    prompt = FLASHCARD_PROMPT_TEMPLATE.format(num_cards=num_cards, context=context)
+    max_tokens = min(8000, 150 * num_cards + 400)
+    raw = generate_with_llm(prompt, max_new_tokens=max_tokens, temperature=0.5)
 
-def generate_flashcards(chunks, num_cards=8, sample_chunks=12):
-    context = _sample_context(chunks, sample_chunks)
+    raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    match = re.search(r"\[.*\]", raw, flags=re.DOTALL)
+    if match:
+        raw = match.group(0)
 
-    for attempt_cards in (num_cards, max(4, num_cards // 2)):
-        prompt = FLASHCARD_PROMPT_TEMPLATE.format(num_cards=attempt_cards, context=context)
-        raw, _ = call_gemini_with_headroom(
-            prompt, max_output_tokens=MAX_TOKENS_FLASHCARDS, temperature=0.5
-        )
-        cards = _extract_json_array(raw)
-        if cards:
-            return [c for c in cards if "question" in c and "answer" in c]
+    try:
+        cards = json.loads(raw)
+        cards = [c for c in cards if "question" in c and "answer" in c]
+    except json.JSONDecodeError:
+        cards = []
 
-    return []
+    return cards
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -535,8 +428,12 @@ def generate_flashcards(chunks, num_cards=8, sample_chunks=12):
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _build_quiz_prompt(context, difficulty, num_questions):
-    return f"""
+def generate_quiz(chunks, difficulty="EZ", num_questions=10, sample_chunks=12):
+    step = max(1, len(chunks) // sample_chunks)
+    sample = chunks[::step][:sample_chunks]
+    context = "\n\n".join(c["text"] for c in sample)
+
+    prompt = f"""
 You are a quiz generator for an AI study assistant.
 
 The quiz MUST be based ONLY on the provided study material.
@@ -573,20 +470,16 @@ IMPORTANT:
 STUDY MATERIAL:
 {context}
 """
+    max_tokens = min(8000, 300 * num_questions + 500)
+    raw = generate_with_llm(prompt, max_new_tokens=max_tokens, temperature=0.6)
 
+    raw = re.sub(r"^```(json)?|```$", "", raw.strip(), flags=re.MULTILINE).strip()
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        raw = match.group(0)
 
-def generate_quiz(chunks, difficulty="EZ", num_questions=10, sample_chunks=12):
-    context = _sample_context(chunks, sample_chunks)
-
-    for attempt_questions in (num_questions, max(3, num_questions // 2)):
-        prompt = _build_quiz_prompt(context, difficulty, attempt_questions)
-        raw, _ = call_gemini_with_headroom(
-            prompt, max_output_tokens=MAX_TOKENS_QUIZ, temperature=0.6
-        )
-        quiz = _extract_json_object_array(raw, "questions")
-        if not quiz:
-            continue
-
+    try:
+        quiz = json.loads(raw)
         questions = quiz.get("questions", [])
         questions = [
             q
@@ -597,88 +490,17 @@ def generate_quiz(chunks, difficulty="EZ", num_questions=10, sample_chunks=12):
             and "correct_answer" in q
             and q["correct_answer"] in [0, 1, 2, 3]
         ]
-        if questions:
-            return questions
+    except json.JSONDecodeError:
+        questions = []
 
-    return []
-
-
-def show_result_banner(won):
-    if won:
-        st.success(f"🎉 **{WIN_MESSAGE}**")
-        if os.path.exists(WIN_IMAGE_PATH):
-            st.image(WIN_IMAGE_PATH, width="stretch")
-        else:
-            st.balloons()
-    else:
-        st.error(f"💀 **{LOSE_MESSAGE}**")
-        if os.path.exists(LOSE_IMAGE_PATH):
-            st.image(LOSE_IMAGE_PATH, width="stretch")
-        else:
-            st.snow()
+    return questions
 
 
-# ──────────────────────────────────────────────────────────────────────────
-# Text-to-speech (Kokoro)
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def clean_for_speech(text):
-    text = re.sub(r"[*_#>`]", "", text)
-    text = re.sub(r"[\U0001F300-\U0001FAFF\u2600-\u27BF]", "", text)
-    text = re.sub(r"\s+", " ", text)
-    return text.strip()
-
-
-def generate_speech_bytes(text):
-    """Returns WAV bytes, or (None, error_message) on failure. Kept in
-    memory (no temp files) since Streamlit Cloud's filesystem is ephemeral
-    and shared across a session's reruns."""
-    pipeline, err = get_tts_pipeline_safe()
-    if pipeline is None:
-        return None, err
-
-    cleaned = clean_for_speech(text)
-    if not cleaned:
-        return None, "Nothing to read aloud."
-
+def show_result_image(url, caption):
     try:
-        audio_parts = []
-        for _, _, audio in pipeline(
-            cleaned,
-            voice=TTS_VOICE,
-            speed=TTS_SPEED,
-            split_pattern=r"(?<=[.!?])\s+",
-        ):
-            if audio is not None:
-                audio_parts.append(np.asarray(audio, dtype=np.float32))
-
-        if not audio_parts:
-            return None, "Kokoro produced no audio for this text."
-
-        audio = np.concatenate(audio_parts)
-        buffer = io.BytesIO()
-        sf.write(buffer, audio, TTS_SAMPLE_RATE, format="WAV")
-        return buffer.getvalue(), None
-    except Exception as e:
-        return None, str(e)
-
-
-def render_listen_button(text, key):
-    """A small on-demand 'listen' control. Generating audio for every past
-    message eagerly would be slow and memory-heavy, so it's done lazily on
-    click and cached in session_state per message key."""
-    audio_key = f"audio_{key}"
-    if st.button("🔊 Listen", key=f"btn_{key}"):
-        with st.spinner("Generating voice..."):
-            audio_bytes, err = generate_speech_bytes(text)
-        if err:
-            st.warning(f"Voice unavailable: {err}")
-        else:
-            st.session_state[audio_key] = audio_bytes
-
-    if audio_key in st.session_state:
-        st.audio(st.session_state[audio_key], format="audio/wav")
+        st.image(url, caption=caption, use_container_width=True)
+    except Exception:
+        st.markdown(f"[View the '{caption}' meme]({url})")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -688,57 +510,81 @@ def render_listen_button(text, key):
 for key, default in {
     "chunks": None,
     "index": None,
+    "llm": None,
+    "tts": None,
+    "voice_enabled": True,
     "conversation_history": [],
     "flashcards": [],
     "quiz_questions": [],
     "quiz_submitted": False,
-    "auto_voice": False,
 }.items():
     if key not in st.session_state:
         st.session_state[key] = default
 
 # ──────────────────────────────────────────────────────────────────────────
-# Sidebar — upload & build index
+# Sidebar — API key, voice toggle, upload & build index
 # ──────────────────────────────────────────────────────────────────────────
 
 with st.sidebar:
     st.markdown("### 📚 Study Material")
+
+    _default_api_key = resolve_api_key()
+    if _default_api_key:
+        api_key = _default_api_key
+        st.caption("✅ Groq API key loaded automatically")
+    else:
+        api_key = st.text_input(
+            "Groq API key",
+            type="password",
+            help="Get one free from console.groq.com/keys. Set GROQ_API_KEY as a "
+                 "Streamlit secret or env var and this box won't show up again.",
+        )
+
+    voice_enabled = st.checkbox("🔊 Speak answers (Kokoro TTS)", value=True)
+
     uploaded_files = st.file_uploader(
         "Upload one or more PDFs", type=["pdf"], accept_multiple_files=True
     )
 
-    if st.button("Build Study Buddy", width="stretch"):
-        if not uploaded_files:
-            st.warning("Upload at least one PDF first.")
+    if st.button(
+        "Build Study Buddy",
+        use_container_width=True,
+        disabled=not uploaded_files or not api_key,
+    ):
+        with st.spinner("Reading, chunking, and embedding your material..."):
+            chunks, index, status = build_index(uploaded_files)
+
+        st.session_state.llm = load_llm(api_key)
+        if voice_enabled:
+            st.session_state.tts = load_tts()
+        st.session_state.voice_enabled = voice_enabled
+
+        st.session_state.chunks = chunks
+        st.session_state.index = index
+        st.session_state.conversation_history = []
+        st.session_state.flashcards = []
+        st.session_state.quiz_questions = []
+        st.session_state.quiz_submitted = False
+
+        if chunks is None:
+            st.error(status)
         else:
-            with st.spinner("Reading, chunking, and embedding your material..."):
-                chunks, index = build_index(uploaded_files)
-            if chunks is not None:
-                st.session_state.chunks = chunks
-                st.session_state.index = index
-                st.session_state.conversation_history = []
-                st.session_state.flashcards = []
-                st.session_state.quiz_questions = []
-                st.session_state.quiz_submitted = False
-                st.success(f"Indexed {len(chunks)} chunks from {len(uploaded_files)} file(s).")
+            st.success(status)
 
     if st.session_state.chunks is not None:
         st.caption(f"Ready — {len(st.session_state.chunks)} chunks loaded.")
-
-    st.markdown("### 🔊 Voice")
-    if TTS_AVAILABLE:
-        st.session_state.auto_voice = st.checkbox(
-            "Read new answers aloud", value=st.session_state.auto_voice
-        )
-    else:
-        st.caption(f"Voice unavailable: {TTS_IMPORT_ERROR}")
 
 # ──────────────────────────────────────────────────────────────────────────
 # Header
 # ──────────────────────────────────────────────────────────────────────────
 
-st.title("🧠 Study Buddy")
-st.caption("Chat with your notes, build flashcards, and quiz yourself — all grounded in your own PDFs.")
+st.markdown(
+    """
+    <div class="sb-title"><h1>🧠 Study Buddy</h1></div>
+    <p>Chat with your notes, build flashcards, and quiz yourself — all grounded in your own PDFs.</p>
+    """,
+    unsafe_allow_html=True,
+)
 
 ready = st.session_state.chunks is not None and st.session_state.index is not None
 
@@ -750,15 +596,15 @@ tab_chat, tab_flashcards, tab_quiz = st.tabs(["💬 Chat", "🗂️ Flashcards",
 
 with tab_chat:
     if not ready:
-        st.info("Upload your PDF(s) and click **Build Study Buddy** in the sidebar to start chatting.")
+        st.info("Upload your PDF(s), add your Groq key, and click **Build Study Buddy** in the sidebar.")
     else:
-        for i, message in enumerate(st.session_state.conversation_history):
+        for message in st.session_state.conversation_history:
             with st.chat_message("user"):
                 st.write(message["question"])
             with st.chat_message("assistant"):
                 st.write(message["answer"])
-                if TTS_AVAILABLE:
-                    render_listen_button(message["answer"], key=f"chat_{i}")
+                if message.get("audio_path") and os.path.exists(message["audio_path"]):
+                    st.audio(message["audio_path"])
 
         question = st.chat_input("Ask StudyBuddy about your material...")
         if question:
@@ -766,34 +612,28 @@ with tab_chat:
                 st.write(question)
 
             with st.chat_message("assistant"):
-                prompt = build_chat_prompt(
-                    question,
-                    st.session_state.conversation_history,
-                    st.session_state.chunks,
-                    st.session_state.index,
-                )
-                result_holder = {}
-                answer = st.write_stream(
-                    stream_chat_response(
-                        prompt, MAX_TOKENS_CHAT, temperature=0.7, result_holder=result_holder
+                with st.spinner("Thinking..."):
+                    answer = study_buddy_answer(
+                        question,
+                        st.session_state.conversation_history,
+                        st.session_state.chunks,
+                        st.session_state.index,
                     )
-                )
-                if result_holder.get("truncated"):
-                    st.caption(
-                        "⚠️ This answer may have been cut short. Try asking a "
-                        "more focused follow-up question."
-                    )
+                st.write(answer)
 
-                if TTS_AVAILABLE and st.session_state.auto_voice and answer:
+                audio_path = None
+                if st.session_state.voice_enabled and st.session_state.tts is not None:
                     with st.spinner("Generating voice..."):
-                        audio_bytes, err = generate_speech_bytes(answer)
-                    if err:
-                        st.warning(f"Voice unavailable: {err}")
-                    else:
-                        st.audio(audio_bytes, format="audio/wav", autoplay=True)
+                        fname = os.path.join(
+                            tempfile.gettempdir(),
+                            f"studybuddy_{len(st.session_state.conversation_history)}.wav",
+                        )
+                        audio_path = generate_speech(answer, fname)
+                    if audio_path:
+                        st.audio(audio_path)
 
             st.session_state.conversation_history.append(
-                {"question": question, "answer": answer}
+                {"question": question, "answer": answer, "audio_path": audio_path}
             )
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -812,16 +652,19 @@ with tab_flashcards:
                     st.session_state.chunks, num_cards=num_cards
                 )
             if not st.session_state.flashcards:
-                st.error(
-                    "Couldn't get usable flashcards back from Gemini. Try again, "
-                    "or generate fewer cards at once."
-                )
+                st.error("Couldn't parse flashcards from the model's response. Try again.")
 
         if st.session_state.flashcards:
             for i, card in enumerate(st.session_state.flashcards, start=1):
-                with st.container(border=True):
-                    st.markdown(f"**Card {i}: {card['question']}**")
-                    st.write(card["answer"])
+                st.markdown(
+                    f"""
+                    <div class="sb-card">
+                        <div class="sb-q">Card {i}: {card['question']}</div>
+                        <div>{card['answer']}</div>
+                    </div>
+                    """,
+                    unsafe_allow_html=True,
+                )
 
 # ──────────────────────────────────────────────────────────────────────────
 # Quiz tab
@@ -846,10 +689,7 @@ with tab_quiz:
                 )
             st.session_state.quiz_submitted = False
             if not st.session_state.quiz_questions:
-                st.error(
-                    "Couldn't get a usable quiz back from Gemini. Try again, "
-                    "or generate fewer questions at once."
-                )
+                st.error("Couldn't parse a quiz from the model's response. Try again.")
 
         if st.session_state.quiz_questions and not st.session_state.quiz_submitted:
             with st.form("quiz_form"):
@@ -887,17 +727,23 @@ with tab_quiz:
             answered = st.session_state.quiz_answered
             total = len(st.session_state.quiz_questions)
 
-            st.metric("Final score", f"{score}/{answered}", help=f"Out of {total} questions total")
+            st.markdown(f"### Final score: {score}/{answered} (of {total} questions)")
 
             won = answered > 0 and (score / answered) >= 0.5
-            show_result_banner(won)
+
+            if won:
+                st.markdown(f'<div class="sb-result-win">{WIN_MESSAGE}</div>', unsafe_allow_html=True)
+                show_result_image(WIN_IMAGE_URL, "+100000 social credit")
+            else:
+                st.markdown(f'<div class="sb-result-lose">{LOSE_MESSAGE}</div>', unsafe_allow_html=True)
+                show_result_image(LOSE_IMAGE_URL, "-10000 social credit")
 
             with st.expander("Review answers"):
                 for i, q in enumerate(st.session_state.quiz_questions):
                     st.markdown(f"**Q{i + 1}. {q['question']}**")
                     st.write("Correct answer:", q["options"][q["correct_answer"]])
                     st.write("Explanation:", q["explanation"])
-                    st.divider()
+                    st.markdown("---")
 
             if st.button("Take a new quiz"):
                 st.session_state.quiz_questions = []

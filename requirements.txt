@@ -1,20 +1,8 @@
-# Core app
-streamlit>=1.50
-
-# LLM (Gemini) — this is the official google-genai SDK, imported as
-# `from google import genai`. Do not confuse with the older, deprecated
-# `google-generativeai` package.
-google-genai>=2.20
-
-# RAG pipeline
-pypdf>=6.0
-sentence-transformers>=3.0
-faiss-cpu>=1.8
-numpy>=1.26
-
-# Text-to-speech (Kokoro). This alone pulls in misaki[en], which in turn
-# pulls in espeakng-loader (a prebuilt espeak-ng shared library shipped as
-# a wheel) — so, unlike the original Colab notebook, NO system-level
-# `apt install espeak-ng` / packages.txt is required for voice to work.
-kokoro>=0.9.4
-soundfile>=0.12
+streamlit>=1.32
+groq
+kokoro
+soundfile
+sentence-transformers
+pypdf
+faiss-cpu
+numpy
