@@ -553,7 +553,7 @@ tab_chat, tab_flashcards, tab_quiz = st.tabs(["💬 Chat", "🗂️ Flashcards",
 
 with tab_chat:
     if not ready:
-        st.info("Upload your PDF(s), add your Groq key, and click **Build Study Buddy** in the sidebar.")
+        st.info("Upload your PDF(s) and click **Build Study Buddy** in the sidebar.")
     else:
         for message in st.session_state.conversation_history:
             with st.chat_message("user"):
