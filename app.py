@@ -41,10 +41,10 @@ TTS_SAMPLE_RATE = 24000
 
 MAX_QUIZ_QUESTIONS = 20
 
-# Replace with direct .gif/.png links (right click the Tenor GIF ->
-# "Copy image address"). tenor.com/view/... page links won't render inline.
-WIN_IMAGE_URL = "https://tenor.com/view/social-credit-credit-social-уважение-плюс-уважение-gif-1626328442317885176"
-LOSE_IMAGE_URL = "https://tenor.com/view/nalog-gif-25906765"
+# Direct Tenor media URLs (not the tenor.com/view/... page links) so they
+# render inline via st.image().
+WIN_IMAGE_URL = "https://media1.tenor.com/m/FpHhGgR4zvgAAAAC/social-credit-credit.gif"
+LOSE_IMAGE_URL = "https://media1.tenor.com/m/F-D5EhlQXdMAAAAC/nalog.gif"
 
 WIN_MESSAGE = "You Win, gg wp"
 LOSE_MESSAGE = "You Lose, train harder twin!"
